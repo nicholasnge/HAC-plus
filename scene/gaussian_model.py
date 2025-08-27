@@ -18,7 +18,6 @@ import torch
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
-from torch_scatter import scatter_max, scatter_min
 
 from utils.general_utils import (build_scaling_rotation, get_expon_lr_func,
                                  inverse_sigmoid, strip_symmetric)
@@ -1061,9 +1060,17 @@ class GaussianModel(nn.Module):
 
                 new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device="cuda"))
 
-                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
-                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
-
+                # ----- REPLACEMENT FOR scatter_max -----
+                # group-wise amax over rows indicated by inverse_indices
+                new_feat_all = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
+                num_groups = selected_grid_coords_unique.shape[0]
+                feat_dim = new_feat_all.size(1)
+                idx_expand = inverse_indices.unsqueeze(1).expand(-1, feat_dim)  # [num_sel, feat_dim]
+                group_max = torch.full((num_groups, feat_dim), float('-inf'),
+                                    device=new_feat_all.device, dtype=new_feat_all.dtype)
+                group_max.scatter_reduce_(0, idx_expand, new_feat_all, reduce='amax', include_self=False)
+                new_feat = group_max[remove_duplicates]
+                # --------------------------------------
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).float().cuda()
                 new_masks = torch.ones_like(candidate_anchor[:, 0:1]).unsqueeze(dim=1).repeat([1, self.n_offsets+1, 1]).float().cuda()
 
@@ -1072,9 +1079,11 @@ class GaussianModel(nn.Module):
                 parent_anchor_ids_flat = torch.arange(N_anchors, device='cuda').repeat_interleave(self.n_offsets)
                 # only the selected candidates this round
                 parent_ids_sel = parent_anchor_ids_flat[candidate_mask.view(-1)]  # [num_sel]
-                # pick the first candidate index per unique grid group
+                # ----- REPLACEMENT FOR scatter_min (get first index per group) -----
                 lin_idx = torch.arange(parent_ids_sel.shape[0], device='cuda')
-                first_idx, _ = scatter_min(lin_idx, inverse_indices, dim=0)       # [num_groups]
+                first_idx = torch.full((num_groups,), lin_idx.numel(), device='cuda', dtype=lin_idx.dtype)
+                first_idx.scatter_reduce_(0, inverse_indices, lin_idx, reduce='amin', include_self=False)
+                # -------------------------------------------------------------------
                 # keep only groups that actually become new anchors
                 new_parent_ids = parent_ids_sel[first_idx][remove_duplicates]      # [num_new]
                 new_object_id  = self._object_id[new_parent_ids].to(torch.int32)   # [num_new]
