@@ -18,7 +18,7 @@ import torch
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
-from torch_scatter import scatter_max
+from torch_scatter import scatter_max, scatter_min
 
 from utils.general_utils import (build_scaling_rotation, get_expon_lr_func,
                                  inverse_sigmoid, strip_symmetric)
@@ -298,6 +298,9 @@ class GaussianModel(nn.Module):
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+
+        # NEW
+        self._object_id = torch.empty(0)
 
         self.optimizer = None
         self.percent_dense = 0
@@ -589,7 +592,38 @@ class GaussianModel(nn.Module):
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        
+        self._object_id = torch.zeros(fused_point_cloud.shape[0], dtype=torch.int32, device='cuda')
 
+    def get_entropy_sample_mask(self, frac_total=0.05, bias_weight={0: 2.0, 1: 1.0}):
+        """
+        Sample ~frac_total of all anchors, but with bias by object id.
+
+        Args:
+            frac_total (float): fraction of total anchors to sample.
+            bias_weight (dict[int,float]): sampling weight per object_id.
+                                        e.g. {0: 2.0, 1: 1.0}
+        Returns:
+            mask (torch.BoolTensor): [N] bool mask, True for chosen anchors.
+        """
+        N = self._anchor.shape[0]
+        obj_ids = self._object_id
+        k = max(1, int(frac_total * N))  # total number to sample
+
+        # Build weights
+        weights = torch.ones(N, device="cuda", dtype=torch.float32)
+        if bias_weight:
+            for oid, w in bias_weight.items():
+                weights[obj_ids == oid] = w
+
+        # Normalize to probs
+        probs = weights / weights.sum()
+
+        # Sample without replacement
+        chosen = torch.multinomial(probs, num_samples=k, replacement=False)
+        mask = torch.zeros(N, dtype=torch.bool, device="cuda")
+        mask[chosen] = True
+        return mask
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -762,6 +796,56 @@ class GaussianModel(nn.Module):
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
+    def save_ply_subset(self, path: str, mask: torch.Tensor):
+        """
+        Save only the anchors selected by `mask` (shape [N], bool) to a PLY.
+        """
+        from utils.system_utils import mkdir_p
+        mkdir_p(os.path.dirname(path))
+
+        mask = mask.to(self._anchor.device)
+        if mask.dtype != torch.bool:
+            mask = mask.bool()
+
+        if mask.numel() == 0 or mask.sum().item() == 0:
+            # Nothing to save; write an empty PLY with the same schema.
+            dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+            elements = np.empty(0, dtype=dtype_full)
+            el = PlyElement.describe(elements, 'vertex')
+            PlyData([el]).write(path)
+            return
+
+        # Gather tensors (same layout as save_ply), then index by mask
+        anchor = self._anchor.detach().cpu().numpy()
+        normals = np.zeros_like(anchor)
+        anchor_feat = self._anchor_feat.detach().cpu().numpy()
+        offset = (self._offset.detach().transpose(1, 2)
+                .flatten(start_dim=1).contiguous().cpu().numpy())
+        mask_np = (self._mask.detach().transpose(1, 2)
+                .flatten(start_dim=1).contiguous().cpu().numpy())
+        opacities = self._opacity.detach().cpu().numpy()
+        scale = self._scaling.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        # Apply mask
+        m = mask.detach().cpu().numpy()
+        anchor = anchor[m]
+        normals = normals[m]
+        anchor_feat = anchor_feat[m]
+        offset = offset[m]
+        mask_np = mask_np[m]
+        opacities = opacities[m]
+        scale = scale[m]
+        rotation = rotation[m]
+
+        # Write
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        attributes = np.concatenate((anchor, normals, offset, mask_np, anchor_feat, opacities, scale, rotation), axis=1)
+        elements = np.empty(anchor.shape[0], dtype=dtype_full)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+
     def load_ply_sparse_gaussian(self, path):
         plydata = PlyData.read(path)
 
@@ -915,26 +999,30 @@ class GaussianModel(nn.Module):
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        # NEW: keep object_id in sync with pruning
+        self._object_id   = self._object_id[valid_points_mask]
 
+    def anchor_growing(self, grads, per_thresh_vec, offset_mask):
+        init_length = self.get_anchor.shape[0] * self.n_offsets
+        for i in range(self.update_depth):
+            scale = (self.update_hierachy_factor // 2) ** i
+            cur_threshold = per_thresh_vec * scale        # [N*K]
 
-    def anchor_growing(self, grads, threshold, offset_mask):
-        init_length = self.get_anchor.shape[0]*self.n_offsets
-        for i in range(self.update_depth):  # 3
-            # for self.update_depth=3, self.update_hierachy_factor=4: 2**0, 2**1, 2**2
-            cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
             candidate_mask = (grads >= cur_threshold)
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
 
             rand_mask = torch.rand_like(candidate_mask.float()) > (0.5**(i+1))
-            rand_mask = rand_mask.cuda()
             candidate_mask = torch.logical_and(candidate_mask, rand_mask)
 
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
             if length_inc == 0:
-                if i > 0:
-                    continue
+                if i > 0: continue
             else:
-                candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
+                candidate_mask = torch.cat([
+                    candidate_mask,
+                    torch.zeros(length_inc, dtype=torch.bool, device="cuda")
+                ], dim=0)
+            
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:, :3].unsqueeze(dim=1)
 
             # for self.update_depth=3, self.update_hierachy_factor=4: 4**0, 4**1, 4**2
@@ -953,8 +1041,8 @@ class GaussianModel(nn.Module):
                 chunk_size = 4096
                 max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
                 remove_duplicates_list = []
-                for i in range(max_iters):
-                    cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[i*chunk_size:(i+1)*chunk_size, :]).all(-1).any(-1).view(-1)
+                for j in range(max_iters):
+                    cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[j*chunk_size:(j+1)*chunk_size, :]).all(-1).any(-1).view(-1)
                     remove_duplicates_list.append(cur_remove_duplicates)
 
                 remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
@@ -978,6 +1066,18 @@ class GaussianModel(nn.Module):
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).float().cuda()
                 new_masks = torch.ones_like(candidate_anchor[:, 0:1]).unsqueeze(dim=1).repeat([1, self.n_offsets+1, 1]).float().cuda()
+
+                # NEW
+                N_anchors = self.get_anchor.shape[0]
+                parent_anchor_ids_flat = torch.arange(N_anchors, device='cuda').repeat_interleave(self.n_offsets)
+                # only the selected candidates this round
+                parent_ids_sel = parent_anchor_ids_flat[candidate_mask.view(-1)]  # [num_sel]
+                # pick the first candidate index per unique grid group
+                lin_idx = torch.arange(parent_ids_sel.shape[0], device='cuda')
+                first_idx, _ = scatter_min(lin_idx, inverse_indices, dim=0)       # [num_groups]
+                # keep only groups that actually become new anchors
+                new_parent_ids = parent_ids_sel[first_idx][remove_duplicates]      # [num_new]
+                new_object_id  = self._object_id[new_parent_ids].to(torch.int32)   # [num_new]
 
                 d = {
                     "anchor": candidate_anchor,
@@ -1007,15 +1107,28 @@ class GaussianModel(nn.Module):
                 self._offset = optimizable_tensors["offset"]
                 self._mask = optimizable_tensors["mask"]
                 self._opacity = optimizable_tensors["opacity"]
+                self._object_id = torch.cat((self._object_id, new_object_id))
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
-        # # adding anchors
+    def adjust_anchor(self, grad_scale_by_obj, prune_scale_by_obj, check_interval=100, 
+                      success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+        # grads per offset
         grads = self.offset_gradient_accum / self.offset_denom
         grads[grads.isnan()] = 0.0
-        grads_norm = torch.norm(grads, dim=-1)
-        offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
+        grads_norm = torch.norm(grads, dim=-1)                     # [N*K]
+        offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(1)
 
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        # --- Per-anchor grad/prune scales from object_id ---
+        N, K = self._anchor.shape[0], self.n_offsets
+        obj_ids = self._object_id
+        grad_scale = torch.ones(N, device="cuda", dtype=torch.float32)
+        for oid, val in grad_scale_by_obj.items():
+            grad_scale[obj_ids == oid] = val
+
+        # Broadcast to [N*K]
+        per_thresh_vec = (grad_threshold * grad_scale).repeat_interleave(K)
+
+        # Grow
+        self.anchor_growing(grads_norm, per_thresh_vec, offset_mask)
 
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -1030,10 +1143,20 @@ class GaussianModel(nn.Module):
                                            device=self.offset_gradient_accum.device)
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
 
-        # # prune anchors
-        prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
-        anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
-        prune_mask = torch.logical_and(prune_mask, anchors_mask)  # [N]
+        # --- rebuild prune_scale AFTER growth ---
+        N = self._anchor.shape[0]
+        obj_ids = self._object_id
+        prune_scale = torch.ones(N, device="cuda", dtype=torch.float32)
+        for oid, val in prune_scale_by_obj.items():
+            prune_scale[obj_ids == oid] = val
+        prune_thresh = (min_opacity * prune_scale).view(N, 1)
+        
+        # --- Pruning ---
+        N = self._anchor.shape[0]
+        prune_thresh = (min_opacity * prune_scale).view(N, 1)   # [N,1]
+        prune_mask = (self.opacity_accum < prune_thresh * self.anchor_demon).squeeze(1)
+        anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(1)
+        prune_mask = torch.logical_and(prune_mask, anchors_mask)
 
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]

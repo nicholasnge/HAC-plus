@@ -13,12 +13,121 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.general_utils import PILtoTorch
+from PIL import Image
+import random
+import cv2
+from collections import deque
+import threading
+import time
+
+class CameraManager:
+    def __init__(self, all_cameras, buffer_size=30):
+        self.buffer_size = buffer_size
+        self.all_cameras = all_cameras
+        self.viewpoint_indices = list(range(len(self.all_cameras)))
+        self.queue = deque()
+        self.toUnload = deque()
+        self.lock = threading.Lock()
+        self.queue_not_empty = threading.Condition()
+        
+        for _ in range(buffer_size):
+            vind = self.viewpoint_indices.pop()
+            self.all_cameras[vind].load()
+            self.queue.append(vind)
+
+    def getNextCamera(self):
+        # Spawn loader thread
+        threading.Thread(target=self.loadNext, daemon=True).start()
+
+        with self.queue_not_empty:
+            while not self.queue:
+                print("[CameraManager] Waiting for camera to be loaded...")
+                self.queue_not_empty.wait()
+
+            vind = self.queue.pop()
+            self.toUnload.append(vind)
+        
+        cam = self.all_cameras[vind]
+        while not cam.loaded:
+            print(f"[CameraManager] Waiting for camera {cam.image_path} to finish loading...")
+            time.sleep(0.01)
+            print(f"[CameraManager] Waiting for camera {cam.image_path} to finish loading...")
+            time.sleep(0.01)
+            print(f"[CameraManager] Waiting for camera {cam.image_path} to finish loading...")
+            time.sleep(0.01)
+            cam.load()
+            print(f"[CameraManager] Sent load again to camera {cam.image_path}")
+
+        return cam
+
+    def loadNext(self):
+        with self.lock:
+            # Refill viewpoint indices if empty
+            if not self.viewpoint_indices:
+                self.viewpoint_indices = list(range(len(self.all_cameras)))
+
+            # Unload camera if available
+            if len(self.toUnload) > 5:
+                unloadIdx = self.toUnload.popleft()
+                self.all_cameras[unloadIdx].unload()
+
+            # Load a new camera
+            vind = self.viewpoint_indices.pop()
+            self.all_cameras[vind].load()
+
+            with self.queue_not_empty:
+                self.queue.append(vind)
+                self.queue_not_empty.notify()
+
+    def toggleMaskLoadingOff(self):
+        for camera in self.all_cameras:
+            camera.loadmaskbool = False
+            del camera.cpu_mask
+            camera.cpu_mask = None
+
+class UnlimitedVRAMCameraManager:
+    def __init__(self, all_cameras, seed=None):
+        """
+        Loads all cameras (images + masks) to VRAM immediately and
+        serves them in a shuffled order forever.
+        """
+        self.all_cameras = all_cameras
+        self._rng = random.Random(seed)
+
+        # Eager-load everything to GPU (unlimited VRAM assumption)
+        for cam in self.all_cameras:
+            if not cam.loaded:
+                cam.load()
+
+        # Build initial shuffled queue
+        self._indices = list(range(len(self.all_cameras)))
+        self._queue = deque()
+        self._reshuffle()
+
+    def _reshuffle(self):
+        self._rng.shuffle(self._indices)
+        self._queue = deque(self._indices)
+
+    def getNextCamera(self):
+        if not self._queue:
+            self._reshuffle()
+        vind = self._queue.popleft()  # or .pop() if you prefer LIFO
+        cam = self.all_cameras[vind]
+        if not cam.loaded:
+            cam.load()  # safety if something elsewhere unloaded it
+        return cam
+
+    def __len__(self):
+        return len(self.all_cameras)
+    
+    def toggleMaskLoadingOff(self):
+        return
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
-                 image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
-                 ):
+    def __init__(self, image_path, mask_path, resolution, colmap_id, R, T, FoVx, FoVy, 
+                 image_name, uid, trans=np.array([0.0, 0.0, 0.0]), scale=1.0, 
+                 data_device="cuda"):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -28,44 +137,65 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
-
-        try:
-            self.data_device = torch.device(data_device)
-        except Exception as e:
-            print(e)
-            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
-            self.data_device = torch.device("cuda")
-
-        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
-        self.image_width = self.original_image.shape[2]
-        self.image_height = self.original_image.shape[1]
-
-        if gt_alpha_mask is not None:
-            self.original_image *= gt_alpha_mask.to(self.data_device)
-        else:
-            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
-
-        self.zfar = 100.0
-        self.znear = 0.01
-
+        self.image_path = image_path
+        self.mask_path = mask_path
+        self.resolution = resolution
+        self.data_device = torch.device(data_device)
         self.trans = trans
         self.scale = scale
+        self.image_width = self.resolution[0]
+        self.image_height = self.resolution[1]
+
+        self.loadmaskbool = True
+        self.mask = None
+        self.original_image = None
+        
+        self.cpu_original_image = None
+        self.cpu_mask = None
+
+        self.loaded = False
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.projection_matrix = getProjectionMatrix(znear=0.01, zfar=100.0, fovX=FoVx, fovY=FoVy).transpose(0, 1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
-class MiniCam:
-    def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
-        self.image_width = width
-        self.image_height = height    
-        self.FoVy = fovy
-        self.FoVx = fovx
-        self.znear = znear
-        self.zfar = zfar
-        self.world_view_transform = world_view_transform
-        self.full_proj_transform = full_proj_transform
-        view_inv = torch.inverse(self.world_view_transform)
-        self.camera_center = view_inv[3][:3]
+    def load(self):
+        if self.loaded:
+            print(f"Already loaded: {self.image_path}")
+            return
 
+        if self.cpu_original_image is None:
+            # Load from disk and keep on CPU
+            image = Image.open(self.image_path)
+            resized_image_rgb = PILtoTorch(image, self.resolution)
+            gt_image = resized_image_rgb[:3, ...]
+            self.cpu_alpha_mask = resized_image_rgb[3:4, ...] if resized_image_rgb.shape[0] == 4 \
+                                else torch.ones_like(resized_image_rgb[0:1, ...])
+            self.cpu_original_image = gt_image.clamp(0.0, 1.0)
+            if self.loadmaskbool:
+                self.cpu_mask = PILtoTorch(Image.open(self.mask_path), self.resolution)[0:1, ...] \
+                                if self.mask_path else torch.ones_like(self.cpu_alpha_mask)
+
+        # Transfer from CPU to GPU
+        self.original_image = self.cpu_original_image.to(self.data_device)
+        self.alpha_mask = self.cpu_alpha_mask.to(self.data_device)
+        if self.loadmaskbool:
+            self.mask = self.cpu_mask.to(self.data_device)
+        self.loaded = True
+
+
+    def unload(self):
+        if not self.loaded:
+            print(f"Already unloaded: {self.image_path}")
+            return
+
+        del self.original_image
+        del self.alpha_mask
+        del self.mask
+        if hasattr(self, "depth_mask"):
+            del self.depth_mask
+        torch.cuda.empty_cache()
+        self.original_image = None
+        self.mask = None
+        self.loaded = False

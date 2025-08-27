@@ -17,14 +17,14 @@ import torch.nn.functional as nnf
 from einops import repeat
 
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+import diff_gaussian_rasterization as dgr
+import diff_gaussian_rasterization_score as dgrs
 from scene.gaussian_model import GaussianModel
 from utils.encodings import STE_binary, STE_multistep
 
 
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, step=0):
     ## view frustum filtering for acceleration
-
     time_sub = 0
 
     if visible_mask is None:
@@ -69,7 +69,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * Q_offsets.unsqueeze(1)
 
             # for entropy
-            choose_idx = torch.rand_like(pc.get_anchor[:, 0]) <= 0.05
+            #choose_idx = torch.rand_like(pc.get_anchor[:, 0]) <= 0.05
+            choose_idx = pc.get_entropy_sample_mask()
             anchor_chosen = pc.get_anchor[choose_idx]
             feat_chosen = pc._anchor_feat[choose_idx]
             grid_offsets_chosen = pc._offset[choose_idx]
@@ -215,10 +216,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     Background tensor (bg_color) must be on GPU!
     """
-    is_training = pc.get_color_mlp.training
-
+    is_training = True#pc.get_color_mlp.training
+    
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask, bit_per_param, bit_per_feat_param, bit_per_scaling_param, bit_per_offsets_param = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, bp_param, bp_feat_param, bp_scaling_param, bp_offsets_param = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
     else:
         xyz, color, opacity, scaling, rot, time_sub = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
 
@@ -232,8 +233,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    raster_settings = GaussianRasterizationSettings(
+    raster_settings = dgr.GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -248,7 +248,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         debug=pipe.debug
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    rasterizer = dgr.GaussianRasterizer(raster_settings=raster_settings)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii = rasterizer(
@@ -270,20 +270,154 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
-                "bit_per_param": bit_per_param,
-                "bit_per_feat_param": bit_per_feat_param,
-                "bit_per_scaling_param": bit_per_scaling_param,
-                "bit_per_offsets_param": bit_per_offsets_param,
-                }
+                "bit_per_param": bp_param,
+                "bit_per_feat_param": bp_feat_param,
+                "bit_per_scaling_param": bp_scaling_param,
+                "bit_per_offsets_param": bp_offsets_param}
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
-                "time_sub": time_sub,
-                }
+                "time_sub": time_sub}
+    
 
+def renderWithScore(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+    xyz, color, opacity, scaling, rot, neural_opacity, mask, anchor_map = generate_neural_gaussians_score(viewpoint_camera, pc, visible_mask)
 
+    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    if retain_grad:
+        try:
+            screenspace_points.retain_grad()
+        except:
+            pass
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = dgrs.GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=1,
+        campos=viewpoint_camera.camera_center,
+        mask=viewpoint_camera.mask, #NEW
+        prefiltered=False,
+        debug=pipe.debug
+    )
+
+    rasterizer = dgrs.GaussianRasterizer(raster_settings=raster_settings)
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    rendered_image, radii, gaussian_scores = rasterizer(
+        means3D = xyz,
+        means2D = screenspace_points,
+        shs = None,
+        colors_precomp = color,
+        opacities = opacity,
+        scales = scaling,
+        rotations = rot,
+        cov3D_precomp = None)
+
+    return {"render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter" : radii > 0,
+            "radii": radii,
+            "selection_mask": mask,
+            "neural_opacity": neural_opacity,
+            "scaling": scaling,
+            "bit_per_param": None,
+            "bit_per_feat_param": None,
+            "bit_per_scaling_param": None,
+            "bit_per_offsets_param": None,
+            "gaussian_scores" : gaussian_scores,
+            "anchor_map" : anchor_map}
+
+def generate_neural_gaussians_score(viewpoint_camera, pc : GaussianModel, visible_mask=None):
+    ## view frustum filtering for acceleration
+
+    if visible_mask is None:
+        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
+
+    anchor = pc.get_anchor[visible_mask]
+    feat = pc._anchor_feat[visible_mask]
+    grid_offsets = pc._offset[visible_mask]
+    grid_scaling = pc.get_scaling[visible_mask]
+    binary_grid_masks = pc.get_mask[visible_mask]  # [N_vis, 10, 1]
+
+    ob_view = anchor - viewpoint_camera.camera_center
+    ob_dist = ob_view.norm(dim=1, keepdim=True)
+    ob_view = ob_view / ob_dist
+
+    ## view-adaptive feature
+    if pc.use_feat_bank:
+        cat_view = torch.cat([ob_view, ob_dist], dim=1)  # [3+1]
+
+        bank_weight = pc.get_featurebank_mlp(cat_view).unsqueeze(dim=1)  # [N_visible_anchor, 1, 3]
+
+        feat = feat.unsqueeze(dim=-1)  # feat: [N_visible_anchor, 32]
+        feat = \
+            feat[:, ::4, :1].repeat([1, 4, 1])*bank_weight[:, :, :1] + \
+            feat[:, ::2, :1].repeat([1, 2, 1])*bank_weight[:, :, 1:2] + \
+            feat[:, ::1, :1]*bank_weight[:, :, 2:]
+        feat = feat.squeeze(dim=-1)  # [N_visible_anchor, 32]
+
+    cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1)  # [N_visible_anchor, 32+3+1]
+
+    neural_opacity = pc.get_opacity_mlp(cat_local_view)  # [N_visible_anchor, K]
+    neural_opacity = neural_opacity.reshape([-1, 1])  # [N_visible_anchor*K, 1]
+    mask = (neural_opacity > 0.0)
+    mask = mask.view(-1)  # [N_visible_anchor*K]
+
+    #NEW
+    with torch.no_grad():
+        # [N_visible] original indices of anchors that survived prefiltering
+        visible_anchor_idx = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)
+        # Expand to N_visible * K (one entry per potential gaussian)
+        anchor_idx_expanded = visible_anchor_idx.repeat_interleave(pc.n_offsets)         # [N_visible*K]
+        # Keep only the gaussians whose neural opacity > 0  (your `mask`)
+        anchor_map = anchor_idx_expanded[mask]                                  # [N_gauss_kept]
+
+    # select opacity
+    opacity = neural_opacity[mask]  # [N_opacity_pos_gaussian, 1]
+
+    # get offset's color
+    color = pc.get_color_mlp(cat_local_view)  # [N_visible_anchor, K*3]
+    color = color.reshape([anchor.shape[0] * pc.n_offsets, 3])  # [N_visible_anchor*K, 3]
+
+    # get offset's cov
+    scale_rot = pc.get_cov_mlp(cat_local_view)  # [N_visible_anchor, K*7]
+    scale_rot = scale_rot.reshape([anchor.shape[0] * pc.n_offsets, 7])  # [N_visible_anchor*K, 7]
+
+    offsets = grid_offsets.view([-1, 3])  # [N_visible_anchor*K, 3]
+
+    # combine for parallel masking
+    concatenated = torch.cat([grid_scaling, anchor], dim=-1)  # [N_visible_anchor, 6+3]
+    concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)  # [N_visible_anchor*K, 6+3]
+    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets],
+                                 dim=-1)  # [N_visible_anchor*K, (6+3)+3+7+3]
+    masked = concatenated_all[mask]  # [N_opacity_pos_gaussian, (6+3)+3+7+3]
+    scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+
+    # post-process cov
+    scaling = scaling_repeat[:, 3:] * torch.sigmoid(scale_rot[:, :3])
+    rot = pc.rotation_activation(scale_rot[:, 3:7])  # [N_opacity_pos_gaussian, 4]
+
+    offsets = offsets * scaling_repeat[:, :3]  # [N_opacity_pos_gaussian, 3]
+    xyz = repeat_anchor + offsets  # [N_opacity_pos_gaussian, 3]
+
+    binary_grid_masks_pergaussian = binary_grid_masks.view(-1, 1)
+    opacity = opacity * binary_grid_masks_pergaussian[mask]
+    scaling = scaling * binary_grid_masks_pergaussian[mask]
+
+    return xyz, color, opacity, scaling, rot, neural_opacity, mask, anchor_map
+    
 def prefilter_voxel(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0,
                     override_color=None):
     """
@@ -302,7 +436,7 @@ def prefilter_voxel(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.T
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
+    raster_settings = dgr.GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -317,7 +451,7 @@ def prefilter_voxel(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.T
         debug=pipe.debug
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    rasterizer = dgr.GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_anchor
 

@@ -1,0 +1,7 @@
+mpeg-pcc-tmc13-master
+outputs
+Scaffold-GS-Viewer
+submodules
+*/__pycache__
+__pycache__
+.vscode

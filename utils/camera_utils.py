@@ -11,46 +11,44 @@
 
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+from PIL import Image
+import os
 
 WARNED = False
 
+def modify_path(file_path):
+    dir_path, filename = os.path.split(file_path)  # Split into directory and filename
+    parent_dir = os.path.dirname(dir_path)  # Get parent directory
+    new_dir = os.path.join(parent_dir, "masks")  # Target directory
+
+    # Change file extension from .JPG to .png
+    base_name, _ = os.path.splitext(filename)  # Remove original extension
+    new_filename = base_name + ".png"  # Set new extension
+
+    return os.path.join(new_dir, new_filename)  # Return new full path
+
 def loadCam(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
+    mask_path = modify_path(cam_info.image_path)
+    image = Image.open(cam_info.image_path)
+    orig_w, orig_h = image.size
 
+    # Compute resolution
     if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
-        if args.resolution == -1:
-            if orig_w > 1600:
-                global WARNED
-                if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-                    WARNED = True
-                global_down = orig_w / 1600
-            else:
-                global_down = 1
-        else:
-            global_down = orig_w / args.resolution
-
+        resolution = (round(orig_w / (resolution_scale * args.resolution)),
+                      round(orig_h / (resolution_scale * args.resolution)))
+    else:
+        global_down = orig_w / (1600 if args.resolution == -1 and orig_w > 1600 else args.resolution)
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-
-    gt_image = resized_image_rgb[:3, ...]
-    loaded_mask = None
-
-    # print(f'gt_image: {gt_image.shape}')
-    if resized_image_rgb.shape[1] == 4:
-        loaded_mask = resized_image_rgb[3:4, ...]
-
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+    return Camera(image_path=cam_info.image_path,
+                  mask_path=mask_path,
+                  resolution=resolution,
+                  colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                  image_name=cam_info.image_name, uid=id,
+                  data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

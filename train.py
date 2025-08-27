@@ -26,7 +26,7 @@ import torchvision.transforms.functional as tf
 import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import prefilter_voxel, render, network_gui
+from gaussian_renderer import prefilter_voxel, render, renderWithScore
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -36,6 +36,9 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.encodings import get_binary_vxl_size
+from scene.cameras import CameraManager, UnlimitedVRAMCameraManager
+import faiss
+from AnchorScoreTracker import AnchorScoreTracker
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
@@ -44,14 +47,6 @@ lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
 bit2MB_scale = 8 * 1024 * 1024
 run_codec = True
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
-    print("found tf board")
-except ImportError:
-    TENSORBOARD_FOUND = False
-    print("not found tf board")
 
 def saveRuntimeCode(dst: str) -> None:
     additionalIgnorePatterns = ['.git', '.gitignore']
@@ -79,7 +74,6 @@ def saveRuntimeCode(dst: str) -> None:
 
 def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
 
     is_synthetic_nerf = os.path.exists(os.path.join(dataset.source_path, "transforms_train.json"))
     gaussians = GaussianModel(
@@ -96,6 +90,8 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         is_synthetic_nerf=is_synthetic_nerf,
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path)
+    anchorScoreTracker = AnchorScoreTracker()
+
     gaussians.update_anchor_bound()
 
     gaussians.training_setup(opt)
@@ -106,30 +102,17 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    viewpoint_stack = None
+    # NEW
+    cameraManager = CameraManager(scene.getTrainCameras(), 60)
+    #cameraManager = UnlimitedVRAMCameraManager(scene.getTrainCameras())
+    initial_num_anchors = gaussians.get_anchor.shape[0]
+
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     torch.cuda.synchronize(); t_start = time.time()
     log_time_sub = 0
     for iteration in range(first_iter, opt.iterations + 1):
-
-        # network gui not available in scaffold-gs yet
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
-
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -137,10 +120,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        viewpoint_cam = cameraManager.getNextCamera()
 
         # Render
         if (iteration - 1) == debug_from:
@@ -148,7 +128,16 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
+        if iteration > 600 and iteration <= args.segIter:
+            render_pkg = renderWithScore(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+            # accumulate gaussian -> anchor
+            gauss_scores = render_pkg["gaussian_scores"].detach().view(-1)     # [N_gauss_kept]
+            anchor_map   = render_pkg["anchor_map"]                   # [N_gauss_kept]
+            anchorScoreTracker.update(gauss_scores, anchor_map, initial_num_anchors)
+        else:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
+
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         bit_per_param = render_pkg["bit_per_param"]
@@ -201,13 +190,56 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
 
             # Log and save
             torch.cuda.synchronize(); t_start_log = time.time()
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, args_param.model_path)
+            #training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, args_param.model_path)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                scene.save_separate(iteration)
             torch.cuda.synchronize(); t_end_log = time.time()
             t_log = t_end_log - t_start_log
             log_time_sub += t_log
+            
+            if iteration == args.segIter:
+                cameraManager.toggleMaskLoadingOff()
+                anchor_scores = anchorScoreTracker.get_scores()
+
+                # 1. Set objectid = 1 if score > ..., else remain 0
+                objectid = torch.zeros_like(anchor_scores, dtype=torch.int8)
+                objectid[anchor_scores > args.segReq] = 1
+                n_init = int(objectid.sum().item())
+                print(f"[seg] anchors above threshold: {n_init}/{len(objectid)}")
+                
+                xyz_all = gaussians.get_anchor.detach().cpu().numpy().astype('float32')
+                objid_np = objectid.cpu().numpy()
+
+                # 2. Expand objectid=1 via FAISS
+                print("expanding objectid 1 via radius search")
+                radius = args.segSpread * scene.cameras_extent
+                src_mask = (objid_np == 1)
+                tgt_mask = (objid_np == 0)
+
+                src_xyz = xyz_all[src_mask]
+                tgt_xyz = xyz_all[tgt_mask]
+                tgt_indices = np.where(tgt_mask)[0]
+
+                index = faiss.IndexFlatL2(3)
+                index.add(tgt_xyz)
+                LIMS, D, I = index.range_search(src_xyz, radius**2)
+                global_ids = tgt_indices[I.astype(np.int64)]
+                unique_ids = np.unique(global_ids)
+                objectid[unique_ids] = 1  # promote these to objectid 1
+
+                print(f"[seg] FAISS promoted anchors: {len(unique_ids)}")
+                n_final = int(objectid.sum().item())
+                print(f"[seg] total anchors after expansion: {n_final}/{len(objectid)} "
+                    f"(+{n_final - n_init} added via FAISS)")
+
+                # 3. Update model
+                gaussians._object_id = objectid.cuda()
+                # Per-anchor object ids (int32)
+                obj_ids = gaussians._object_id  # [N]
+                unique_ids = torch.unique(obj_ids)
+                print(f"unique object ids: {unique_ids.tolist()}")
 
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
@@ -216,7 +248,14 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                 if iteration not in range(3000, 4000):  # let the model get fit to quantization
                     # densification
                     if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                        gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
+                        gaussians.adjust_anchor(
+                            grad_scale_by_obj={0: 1.5, 1: 0.75},
+                            prune_scale_by_obj={0: 1.3, 1: 1.0},
+                            check_interval=opt.update_interval,
+                            success_threshold=opt.success_threshold,
+                            grad_threshold=opt.densify_grad_threshold,
+                            min_opacity=opt.min_opacity
+                        )
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
@@ -251,10 +290,6 @@ def prepare_output_and_logger(args):
 
     # Create Tensorboard writer
     tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
     return tb_writer
 
 
@@ -286,72 +321,6 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                         log_info = scene.gaussians.conduct_decoding(pre_path_name=bit_stream_path)
                         logger.info(log_info)
             torch.cuda.empty_cache()
-            validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
-                                  {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-            for config in validation_configs:
-                # if config['name'] == 'test': assert len(config['cameras']) == 200
-                if config['cameras'] and len(config['cameras']) > 0:
-                    l1_test = 0.0
-                    psnr_test = 0.0
-                    ssim_test = 0.0
-                    lpips_test = 0.0
-
-                    if wandb is not None:
-                        gt_image_list = []
-                        render_image_list = []
-                        errormap_list = []
-
-                    t_list = []
-
-                    for idx, viewpoint in enumerate(config['cameras']):
-                        torch.cuda.synchronize(); t_start = time.time()
-                        voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
-                        # image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
-                        render_output = renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)
-                        image = torch.clamp(render_output["render"], 0.0, 1.0)
-                        time_sub = render_output["time_sub"]
-                        torch.cuda.synchronize(); t_end = time.time()
-                        t_list.append(t_end - t_start - time_sub)
-
-                        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                        if tb_writer and (idx < 30):
-                            tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                            tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
-
-                            if wandb:
-                                render_image_list.append(image[None])
-                                errormap_list.append((gt_image[None]-image[None]).abs())
-
-                            if iteration == testing_iterations[0]:
-                                tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                                if wandb:
-                                    gt_image_list.append(gt_image[None])
-                        l1_test += l1_loss(image, gt_image).mean().double()
-                        psnr_test += psnr(image, gt_image).mean().double()
-                        ssim_test += ssim(image, gt_image).mean().double()
-                        lpips_test += lpips_fn(image, gt_image, normalize=False).detach().mean().double()
-                        # lpips_test += lpips(image, gt_image, net_type='vgg').detach().mean().double()
-
-                    psnr_test /= len(config['cameras'])
-                    ssim_test /= len(config['cameras'])
-                    lpips_test /= len(config['cameras'])
-                    l1_test /= len(config['cameras'])
-                    logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {} ssim {} lpips {}".format(iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test))
-                    test_fps = 1.0 / torch.tensor(t_list[0:]).mean()
-                    logger.info(f'Test FPS: {test_fps.item():.5f}')
-                    if tb_writer:
-                        tb_writer.add_scalar(f'{dataset_name}/test_FPS', test_fps.item(), 0)
-                    if wandb is not None:
-                        wandb.log({"test_fps": test_fps, })
-
-                    if tb_writer:
-                        tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                        tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-                        tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
-                        tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
-                    if wandb is not None:
-                        wandb.log({f"{config['name']}_loss_viewpoint_l1_loss":l1_test, f"{config['name']}_PSNR":psnr_test}, f"ssim{ssim_test}", f"lpips{lpips_test}")
 
         if tb_writer:
             tb_writer.add_scalar(f'{dataset_name}/'+'total_points', scene.gaussians.get_anchor.shape[0], iteration)
@@ -375,7 +344,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     per_view_dict = {}
     psnr_list = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-
+        view.load()
         torch.cuda.synchronize(); t_start = time.time()
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
         render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
@@ -406,6 +375,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
+        view.unload()
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)
@@ -583,6 +553,10 @@ if __name__ == "__main__":
     parser.add_argument("--log2_2D", type=int, default = 15)
     parser.add_argument("--n_features", type=int, default = 4)
     parser.add_argument("--lmbda", type=float, default = 0.001)
+    parser.add_argument("--memMB", type=int, default = None)
+    parser.add_argument("--segIter", type=int, default = 1600)
+    parser.add_argument("--segReq", type=float, default = 0.1)
+    parser.add_argument("--segSpread", type=float, default = 0.05)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -600,11 +574,6 @@ if __name__ == "__main__":
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
         os.system("echo $CUDA_VISIBLE_DEVICES")
         logger.info(f'using GPU {args.gpu}')
-
-    '''try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except:
-        logger.info(f'save code failed~')'''
 
     dataset = args.source_path.split('/')[-1]
     exp_name = args.model_path.split('/')[-2]
@@ -629,7 +598,6 @@ if __name__ == "__main__":
 
     # Start GUI server, configure and run training
     args.port = np.random.randint(10000, 20000)
-    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
     # training

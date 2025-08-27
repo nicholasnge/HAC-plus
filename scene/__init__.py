@@ -17,6 +17,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+import torch
 
 class Scene:
 
@@ -99,6 +100,36 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         self.gaussians.save_mlp_checkpoints(os.path.join(point_cloud_path, "checkpoint.pth"))
+
+    def save_separate(self, iteration):
+        """
+        Save separate PLYs per object id (per-anchor).
+        Writes into: <model_path>/point_cloud/iteration_<iter>/separate/
+        - point_cloud_obj_<id>.ply
+        """
+        base_dir = os.path.join(self.model_path, f"point_cloud/iteration_{iteration}")
+        os.makedirs(base_dir, exist_ok=True)
+
+        # Per-anchor object ids (int32)
+        obj_ids = self.gaussians._object_id  # [N]
+        if obj_ids is None or obj_ids.numel() == 0:
+            print("[save_separate] No object ids found; saving a single 'obj_0' as fallback.")
+            mask0 = torch.ones(self.gaussians.get_anchor.shape[0], dtype=torch.bool, device=self.gaussians._anchor.device)
+            self.gaussians.save_ply_subset(os.path.join(base_dir, "point_cloud0.ply"), mask0)
+            return
+
+        unique_ids = torch.unique(obj_ids)
+        print(f"[save_separate] unique object ids: {unique_ids.tolist()}")
+
+        # Save one PLY per object id
+        for oid in unique_ids.tolist():
+            mask = (obj_ids == int(oid))
+            count = int(mask.sum().item())
+            if count == 0:
+                continue
+            out_path = os.path.join(base_dir, f"point_cloud{oid}.ply")
+            print(f"[save_separate] saving obj_id={oid} with {count} anchors -> {out_path}")
+            self.gaussians.save_ply_subset(out_path, mask)
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
