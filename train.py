@@ -89,6 +89,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         log2_hashmap_size=args_param.log2,
         log2_hashmap_size_2D=args_param.log2_2D,
         is_synthetic_nerf=is_synthetic_nerf,
+        entropy_bias_weight=args.entropy_bias_by_obj
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path)
     anchorScoreTracker = AnchorScoreTracker()
@@ -195,7 +196,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-                scene.save_separate(iteration)
+                #scene.save_separate(iteration)
             torch.cuda.synchronize(); t_end_log = time.time()
             t_log = t_end_log - t_start_log
             log_time_sub += t_log
@@ -250,8 +251,8 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                     # densification
                     if iteration > opt.update_from and iteration % opt.update_interval == 0:
                         gaussians.adjust_anchor(
-                            grad_scale_by_obj={0: 1.5, 1: 0.75},
-                            prune_scale_by_obj={0: 1.3, 1: 1.0},
+                            grad_scale_by_obj=args.grad_scale_by_obj,
+                            prune_scale_by_obj=args.prune_scale_by_obj,
                             check_interval=opt.update_interval,
                             success_threshold=opt.success_threshold,
                             grad_threshold=opt.densify_grad_threshold,
@@ -554,11 +555,48 @@ if __name__ == "__main__":
     parser.add_argument("--log2_2D", type=int, default = 15)
     parser.add_argument("--n_features", type=int, default = 4)
     parser.add_argument("--lmbda", type=float, default = 0.001)
-    parser.add_argument("--memMB", type=int, default = None)
     parser.add_argument("--segIter", type=int, default = 1600)
     parser.add_argument("--segReq", type=float, default = 0.1)
     parser.add_argument("--segSpread", type=float, default = 0.05)
+    parser.add_argument("--grad_scale_by_obj", type=str, default=False)
+    parser.add_argument("--prune_scale_by_obj", type=str, default=False)
+    parser.add_argument("--entropy_bias_by_obj", type=str, default=False)
+
     args = parser.parse_args(sys.argv[1:])
+
+    def _parse_obj_map(s: str):
+        try:
+            d = json.loads(s)
+        except json.JSONDecodeError:
+            # fallback: "0:1.5,1:0.75"
+            d = {}
+            if s.strip():
+                for item in s.split(","):
+                    k, v = item.split(":")
+                    d[k.strip()] = v.strip()
+        # ensure correct dtypes
+        return {int(k): float(v) for k, v in d.items()}
+    def _parse_entropy_bias(s: str):
+        s = s.strip()
+        # Try JSON first
+        try:
+            import json
+            d = json.loads(s)
+            return {int(k): float(v) for k, v in d.items()}
+        except Exception:
+            pass
+        # Fallback: comma-separated "id:weight"
+        out = {}
+        if s:
+            for tok in s.split(","):
+                k, v = tok.split(":")
+                out[int(k.strip())] = float(v.strip())
+        return out
+
+    args.grad_scale_by_obj  = _parse_obj_map(args.grad_scale_by_obj)
+    args.prune_scale_by_obj = _parse_obj_map(args.prune_scale_by_obj)
+    args.entropy_bias_by_obj = _parse_entropy_bias(args.entropy_bias_by_obj)
+
     args.save_iterations.append(args.iterations)
 
     # enable logging

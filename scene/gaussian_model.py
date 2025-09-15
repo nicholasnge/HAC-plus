@@ -253,6 +253,7 @@ class GaussianModel(nn.Module):
                  use_2D: bool=True,
                  decoded_version: bool=False,
                  is_synthetic_nerf: bool=False,
+                 entropy_bias_weight=None
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -300,6 +301,11 @@ class GaussianModel(nn.Module):
 
         # NEW
         self._object_id = torch.empty(0)
+        self.entropy_bias_weight = (
+            {0: 1.0, 1: 1.0} if entropy_bias_weight is None else {
+                int(k): float(v) for k, v in entropy_bias_weight.items()
+            }
+        )
 
         self.optimizer = None
         self.percent_dense = 0
@@ -594,31 +600,29 @@ class GaussianModel(nn.Module):
         
         self._object_id = torch.zeros(fused_point_cloud.shape[0], dtype=torch.int32, device='cuda')
 
-    def get_entropy_sample_mask(self, frac_total=0.05, bias_weight={0: 2.0, 1: 1.0}):
+    def get_entropy_sample_mask(self, frac_total=0.05):
         """
-        Sample ~frac_total of all anchors, but with bias by object id.
+        Sample ~frac_total of all anchors, optionally biased by object id.
 
         Args:
             frac_total (float): fraction of total anchors to sample.
-            bias_weight (dict[int,float]): sampling weight per object_id.
-                                        e.g. {0: 2.0, 1: 1.0}
+            bias_weight (dict[int,float] or None): per-object_id weight.
+                If None, uses self.entropy_bias_weight.
         Returns:
-            mask (torch.BoolTensor): [N] bool mask, True for chosen anchors.
+            mask (torch.BoolTensor): [N] mask of sampled anchors.
         """
+        bias_weight = self.entropy_bias_weight
+
         N = self._anchor.shape[0]
         obj_ids = self._object_id
-        k = max(1, int(frac_total * N))  # total number to sample
+        k = max(1, int(frac_total * N))
 
-        # Build weights
         weights = torch.ones(N, device="cuda", dtype=torch.float32)
         if bias_weight:
             for oid, w in bias_weight.items():
                 weights[obj_ids == oid] = w
 
-        # Normalize to probs
         probs = weights / weights.sum()
-
-        # Sample without replacement
         chosen = torch.multinomial(probs, num_samples=k, replacement=False)
         mask = torch.zeros(N, dtype=torch.bool, device="cuda")
         mask[chosen] = True

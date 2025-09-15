@@ -132,7 +132,7 @@ def render_sets(args_param, dataset : ModelParams, iteration : int, pipeline : P
             n_features_per_level=args_param.n_features,
             log2_hashmap_size=args_param.log2,
             log2_hashmap_size_2D=args_param.log2_2D,
-            decoded_version=False,
+            decoded_version=run_codec,
             is_synthetic_nerf=is_synthetic_nerf,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
