@@ -120,13 +120,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             m0 = (obj_ids_chosen == 0)
             m1 = ~m0
             def _bpp_group(bf, bs, bo, m):
-                # bf, bs, bo have shapes [N_sel, Df] / [N_sel, 6] / [N_sel, 3*K] after masking
+                # bf, bs, bo: tensors with grad (per-symbol bits from entropy models)
                 if m.any():
-                    bits = bf[m].sum() + bs[m].sum() + bo[m].sum()
-                    denom = bf[m].numel() + bs[m].numel() + bo[m].numel()
-                    return (bits / max(1, denom)).detach()
+                    bits = bf[m].sum() + bs[m].sum() + bo[m].sum()     # stays in graph
+                    denom = bf[m].numel() + bs[m].numel() + bo[m].numel()  # Python int (const)
+                    return bits / max(1, denom)                        # <-- NO .detach()
                 else:
-                    return torch.tensor(0.0, device=bf.device)
+                    # empty group: return a 0 tensor on the right device/dtype
+                    return torch.zeros((), device=bf.device, dtype=bf.dtype)
             bpp0 = _bpp_group(bit_feat, bit_scaling, bit_offsets, m0)
             bpp1 = _bpp_group(bit_feat, bit_scaling, bit_offsets, m1)
             bit_per_param_by_obj = {0: bpp0, 1: bpp1}
