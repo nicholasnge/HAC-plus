@@ -40,6 +40,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     bit_per_feat_param = None
     bit_per_scaling_param = None
     bit_per_offsets_param = None
+    bit_per_param_by_obj = None
+
     Q_feat = 1
     Q_scaling = 0.001
     Q_offsets = 0.2
@@ -69,8 +71,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * Q_offsets.unsqueeze(1)
 
             # for entropy
-            #choose_idx = torch.rand_like(pc.get_anchor[:, 0]) <= 0.05
-            choose_idx = pc.get_entropy_sample_mask()
+            choose_idx = torch.rand_like(pc.get_anchor[:, 0]) <= 0.05
+            #choose_idx = pc.get_entropy_sample_mask()
             anchor_chosen = pc.get_anchor[choose_idx]
             feat_chosen = pc._anchor_feat[choose_idx]
             grid_offsets_chosen = pc._offset[choose_idx]
@@ -113,9 +115,26 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             bit_offsets = pc.entropy_gaussian.forward(grid_offsets_chosen, mean_offsets, scale_offsets, Q_offsets.view(-1, 3*pc.n_offsets), pc._offset.mean())
             bit_offsets = bit_offsets * mask_anchor_chosen * binary_grid_masks_chosen
 
+            # NEW calculate bit param by objectid
+            obj_ids_chosen = pc._object_id[choose_idx]  # [N_sel]
+            m0 = (obj_ids_chosen == 0)
+            m1 = ~m0
+            def _bpp_group(bf, bs, bo, m):
+                # bf, bs, bo have shapes [N_sel, Df] / [N_sel, 6] / [N_sel, 3*K] after masking
+                if m.any():
+                    bits = bf[m].sum() + bs[m].sum() + bo[m].sum()
+                    denom = bf[m].numel() + bs[m].numel() + bo[m].numel()
+                    return (bits / max(1, denom)).detach()
+                else:
+                    return torch.tensor(0.0, device=bf.device)
+            bpp0 = _bpp_group(bit_feat, bit_scaling, bit_offsets, m0)
+            bpp1 = _bpp_group(bit_feat, bit_scaling, bit_offsets, m1)
+            bit_per_param_by_obj = {0: bpp0, 1: bpp1}
+
             bit_per_feat_param = torch.sum(bit_feat) / bit_feat.numel()
             bit_per_scaling_param = torch.sum(bit_scaling) / bit_scaling.numel()
             bit_per_offsets_param = torch.sum(bit_offsets) / bit_offsets.numel()
+            #REPLACED BY BIT BY OBJ
             bit_per_param = (torch.sum(bit_feat) + torch.sum(bit_scaling) + torch.sum(bit_offsets)) / \
                             (bit_feat.numel() + bit_scaling.numel() + bit_offsets.numel())
 
@@ -205,7 +224,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         rot = rot[the_mask]
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask, bit_per_param, bit_per_feat_param, bit_per_scaling_param, bit_per_offsets_param
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, bit_per_param, bit_per_feat_param, bit_per_scaling_param, bit_per_offsets_param, bit_per_param_by_obj
     else:
         return xyz, color, opacity, scaling, rot, time_sub
 
@@ -219,7 +238,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
     
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask, bp_param, bp_feat_param, bp_scaling_param, bp_offsets_param = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, bp_param, bp_feat_param, bp_scaling_param, bp_offsets_param, bp_by_obj = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
     else:
         xyz, color, opacity, scaling, rot, time_sub = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
 
@@ -273,7 +292,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "bit_per_param": bp_param,
                 "bit_per_feat_param": bp_feat_param,
                 "bit_per_scaling_param": bp_scaling_param,
-                "bit_per_offsets_param": bp_offsets_param}
+                "bit_per_offsets_param": bp_offsets_param,
+                "bit_per_param_by_obj": bp_by_obj,   # NEW
+            }
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,

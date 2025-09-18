@@ -89,7 +89,6 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         log2_hashmap_size=args_param.log2,
         log2_hashmap_size_2D=args_param.log2_2D,
         is_synthetic_nerf=is_synthetic_nerf,
-        entropy_bias_weight=args.entropy_bias_by_obj
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path)
     anchorScoreTracker = AnchorScoreTracker()
@@ -143,26 +142,6 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         bit_per_param = render_pkg["bit_per_param"]
-        # bit_per_feat_param = render_pkg["bit_per_feat_param"]
-        # bit_per_scaling_param = render_pkg["bit_per_scaling_param"]
-        # bit_per_offsets_param = render_pkg["bit_per_offsets_param"]
-
-        # if iteration % 1000 == 0 and bit_per_param is not None:
-
-        #     ttl_size_feat_MB = bit_per_feat_param.item() * gaussians.get_anchor.shape[0] * gaussians.feat_dim / bit2MB_scale
-        #     ttl_size_scaling_MB = bit_per_scaling_param.item() * gaussians.get_anchor.shape[0] * 6 / bit2MB_scale
-        #     ttl_size_offsets_MB = bit_per_offsets_param.item() * gaussians.get_anchor.shape[0] * 3 * gaussians.n_offsets / bit2MB_scale
-        #     ttl_size_MB = ttl_size_feat_MB + ttl_size_scaling_MB + ttl_size_offsets_MB
-
-        #     logger.info("\n----------------------------------------------------------------------------------------")
-        #     logger.info("\n-----[ITER {}] bits info: bit_per_feat_param={}, anchor_num={}, ttl_size_feat_MB={}-----".format(iteration, bit_per_feat_param.item(), gaussians.get_anchor.shape[0], ttl_size_feat_MB))
-        #     logger.info("\n-----[ITER {}] bits info: bit_per_scaling_param={}, anchor_num={}, ttl_size_scaling_MB={}-----".format(iteration, bit_per_scaling_param.item(), gaussians.get_anchor.shape[0], ttl_size_scaling_MB))
-        #     logger.info("\n-----[ITER {}] bits info: bit_per_offsets_param={}, anchor_num={}, ttl_size_offsets_MB={}-----".format(iteration, bit_per_offsets_param.item(), gaussians.get_anchor.shape[0], ttl_size_offsets_MB))
-        #     logger.info("\n-----[ITER {}] bits info: bit_per_param={}, anchor_num={}, ttl_size_MB={}-----".format(iteration, bit_per_param.item(), gaussians.get_anchor.shape[0], ttl_size_MB))
-        #     with torch.no_grad():
-        #         binary_grid_masks_anchor = gaussians.get_mask_anchor.float()
-        #         mask_1_rate, mask_size_bit, mask_size_MB, mask_numel = get_binary_vxl_size(binary_grid_masks_anchor + 0.0)  # [0, 1] -> [-1, 1]
-        #     logger.info("\n-----[ITER {}] bits info: 1_rate_mask={}, mask_numel={}, mask_size_MB={}-----".format(iteration, mask_1_rate, mask_numel, mask_size_MB))
 
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
@@ -174,7 +153,16 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         if bit_per_param is not None:
             _, bit_hash_grid, MB_hash_grid, _ = get_binary_vxl_size((gaussians.get_encoding_params()+1)/2)
             denom = gaussians._anchor.shape[0]*(gaussians.feat_dim+6+3*gaussians.n_offsets)
-            loss = loss + args_param.lmbda * (bit_per_param + bit_hash_grid / denom)
+
+            bpp_by_obj = render_pkg.get("bit_per_param_by_obj", None)
+            if bpp_by_obj is not None:
+                rate_loss = args_param.lmbda_obj0 * args_param.lmbda * bpp_by_obj.get(0, torch.tensor(0.0, device=image.device)) + \
+                            args_param.lmbda_obj1 * args_param.lmbda * bpp_by_obj.get(1, torch.tensor(0.0, device=image.device))
+                # keep hash-grid under the global lambda (or split if you really want)
+                loss = loss + rate_loss + args_param.lmbda * (bit_hash_grid / denom)
+            else:
+                print("whats going on my man")
+                loss = loss + args_param.lmbda * (bit_per_param + bit_hash_grid / denom)
 
         loss.backward()
 
@@ -242,10 +230,6 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                 obj_ids = gaussians._object_id  # [N]
                 unique_ids = torch.unique(obj_ids)
                 print(f"unique object ids: {unique_ids.tolist()}")
-
-                # prune_mask = (gaussians._object_id == 0)            # bool, True=prune
-                # assert prune_mask.numel() == gaussians._anchor.shape[0], "mask/anchor length mismatch"
-                # gaussians.prune_anchor(prune_mask, prune_mask)
 
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
@@ -564,8 +548,9 @@ if __name__ == "__main__":
     parser.add_argument("--segSpread", type=float, default = 0.05)
     parser.add_argument("--grad_scale_by_obj", type=str, default=False)
     parser.add_argument("--prune_scale_by_obj", type=str, default=False)
-    parser.add_argument("--entropy_bias_by_obj", type=str, default=False)
-
+    parser.add_argument("--lmbda_obj0", type=float, default=None)
+    parser.add_argument("--lmbda_obj1", type=float, default=None)
+    
     args = parser.parse_args(sys.argv[1:])
 
     def _parse_obj_map(s: str):
@@ -580,26 +565,9 @@ if __name__ == "__main__":
                     d[k.strip()] = v.strip()
         # ensure correct dtypes
         return {int(k): float(v) for k, v in d.items()}
-    def _parse_entropy_bias(s: str):
-        s = s.strip()
-        # Try JSON first
-        try:
-            import json
-            d = json.loads(s)
-            return {int(k): float(v) for k, v in d.items()}
-        except Exception:
-            pass
-        # Fallback: comma-separated "id:weight"
-        out = {}
-        if s:
-            for tok in s.split(","):
-                k, v = tok.split(":")
-                out[int(k.strip())] = float(v.strip())
-        return out
 
     args.grad_scale_by_obj  = _parse_obj_map(args.grad_scale_by_obj)
     args.prune_scale_by_obj = _parse_obj_map(args.prune_scale_by_obj)
-    args.entropy_bias_by_obj = _parse_entropy_bias(args.entropy_bias_by_obj)
 
     args.save_iterations.append(args.iterations)
 
