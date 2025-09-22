@@ -91,6 +91,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         is_synthetic_nerf=is_synthetic_nerf,
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path)
+    anchorScoreTracker = AnchorScoreTracker()
 
     gaussians.update_anchor_bound()
 
@@ -103,8 +104,9 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
     iter_end = torch.cuda.Event(enable_timing = True)
 
     # NEW
-    cameraManager = CameraManager(scene.getTrainCameras(), 60)
-    #cameraManager = UnlimitedVRAMCameraManager(scene.getTrainCameras())
+    #cameraManager = CameraManager(scene.getTrainCameras(), 60)
+    cameraManager = UnlimitedVRAMCameraManager(scene.getTrainCameras())
+    initial_num_anchors = gaussians.get_anchor.shape[0]
 
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -127,7 +129,15 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
+        if iteration > 1200 and iteration <= args.segIter:
+            render_pkg = renderWithScore(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+            # accumulate gaussian -> anchor
+            gauss_scores = render_pkg["gaussian_scores"].detach().view(-1)     # [N_gauss_kept]
+            anchor_map   = render_pkg["anchor_map"]                   # [N_gauss_kept]
+            anchorScoreTracker.update(gauss_scores, anchor_map, initial_num_anchors)
+        else:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
+
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         bit_per_param = render_pkg["bit_per_param"]
@@ -168,6 +178,48 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
             torch.cuda.synchronize(); t_end_log = time.time()
             t_log = t_end_log - t_start_log
             log_time_sub += t_log
+            
+            if iteration == args.segIter:
+                cameraManager.toggleMaskLoadingOff()
+                anchor_scores = anchorScoreTracker.get_scores()
+
+                # 1. Set objectid = 1 if score > ..., else remain 0
+                objectid = torch.zeros_like(anchor_scores, dtype=torch.int8)
+                objectid[anchor_scores > args.segReq] = 1
+                n_init = int(objectid.sum().item())
+                print(f"[seg] anchors above threshold: {n_init}/{len(objectid)}")
+                
+                xyz_all = gaussians.get_anchor.detach().cpu().numpy().astype('float32')
+                objid_np = objectid.cpu().numpy()
+
+                # 2. Expand objectid=1 via FAISS
+                print("expanding objectid 1 via radius search")
+                radius = args.segSpread * scene.cameras_extent
+                src_mask = (objid_np == 1)
+                tgt_mask = (objid_np == 0)
+
+                src_xyz = xyz_all[src_mask]
+                tgt_xyz = xyz_all[tgt_mask]
+                tgt_indices = np.where(tgt_mask)[0]
+
+                index = faiss.IndexFlatL2(3)
+                index.add(tgt_xyz)
+                LIMS, D, I = index.range_search(src_xyz, radius**2)
+                global_ids = tgt_indices[I.astype(np.int64)]
+                unique_ids = np.unique(global_ids)
+                objectid[unique_ids] = 1  # promote these to objectid 1
+
+                print(f"[seg] FAISS promoted anchors: {len(unique_ids)}")
+                n_final = int(objectid.sum().item())
+                print(f"[seg] total anchors after expansion: {n_final}/{len(objectid)} "
+                    f"(+{n_final - n_init} added via FAISS)")
+
+                # 3. Update model
+                gaussians._object_id = objectid.cuda()
+                # Per-anchor object ids (int32)
+                obj_ids = gaussians._object_id  # [N]
+                unique_ids = torch.unique(obj_ids)
+                print(f"unique object ids: {unique_ids.tolist()}")
 
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
@@ -177,8 +229,8 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                     # densification
                     if iteration > opt.update_from and iteration % opt.update_interval == 0:
                         gaussians.adjust_anchor(
-                            grad_scale_by_obj={0: 1.0, 1: 1.0},
-                            prune_scale_by_obj={0: 1.0, 1: 1.0},
+                            grad_scale_by_obj=args.grad_scale_by_obj,
+                            prune_scale_by_obj=args.prune_scale_by_obj,
                             check_interval=opt.update_interval,
                             success_threshold=opt.success_threshold,
                             grad_threshold=opt.densify_grad_threshold,
@@ -481,8 +533,29 @@ if __name__ == "__main__":
     parser.add_argument("--log2_2D", type=int, default = 15)
     parser.add_argument("--n_features", type=int, default = 4)
     parser.add_argument("--lmbda", type=float, default = 0.001)
+    parser.add_argument("--segIter", type=int, default = 1600)
+    parser.add_argument("--segReq", type=float, default = 0.1)
+    parser.add_argument("--segSpread", type=float, default = 0.05)
+    parser.add_argument("--grad_scale_by_obj", type=str, default=False)
+    parser.add_argument("--prune_scale_by_obj", type=str, default=False)
     
     args = parser.parse_args(sys.argv[1:])
+
+    def _parse_obj_map(s: str):
+        try:
+            d = json.loads(s)
+        except json.JSONDecodeError:
+            # fallback: "0:1.5,1:0.75"
+            d = {}
+            if s.strip():
+                for item in s.split(","):
+                    k, v = item.split(":")
+                    d[k.strip()] = v.strip()
+        # ensure correct dtypes
+        return {int(k): float(v) for k, v in d.items()}
+
+    args.grad_scale_by_obj  = _parse_obj_map(args.grad_scale_by_obj)
+    args.prune_scale_by_obj = _parse_obj_map(args.prune_scale_by_obj)
 
     args.save_iterations.append(args.iterations)
 
