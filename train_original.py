@@ -487,8 +487,6 @@ if __name__ == "__main__":
     parser.add_argument("--segSpread", type=float, default = 0.05)
     parser.add_argument("--grad_scale_by_obj", type=str, default=False)
     parser.add_argument("--prune_scale_by_obj", type=str, default=False)
-    parser.add_argument("--lmbda_obj0", type=float, default=None)
-    parser.add_argument("--lmbda_obj1", type=float, default=None)
     
     args = parser.parse_args(sys.argv[1:])
 
