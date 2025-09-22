@@ -957,34 +957,7 @@ class GaussianModel(nn.Module):
 
         return optimizable_tensors
 
-    def prune_anchor(self, prune_mask, anchors_mask):
-        # update offset_denom
-        offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
-        offset_denom = offset_denom.view([-1, 1])
-        del self.offset_denom
-        self.offset_denom = offset_denom
-
-        offset_gradient_accum = self.offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask]
-        offset_gradient_accum = offset_gradient_accum.view([-1, 1])
-        del self.offset_gradient_accum
-        self.offset_gradient_accum = offset_gradient_accum
-
-        # update opacity accum
-        if anchors_mask.sum()>0:
-            self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
-            self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
-
-        temp_opacity_accum = self.opacity_accum[~prune_mask]
-        del self.opacity_accum
-        self.opacity_accum = temp_opacity_accum
-
-        temp_anchor_demon = self.anchor_demon[~prune_mask]
-        del self.anchor_demon
-        self.anchor_demon = temp_anchor_demon
-
-        # above code transferred from adjust anchor
-
-
+    def prune_anchor(self, prune_mask):
         valid_points_mask = ~prune_mask
 
         optimizable_tensors = self._prune_anchor_optimizer(valid_points_mask)
@@ -1165,8 +1138,32 @@ class GaussianModel(nn.Module):
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(1)
         prune_mask = torch.logical_and(prune_mask, anchors_mask)
 
+        # update offset_denom
+        offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
+        offset_denom = offset_denom.view([-1, 1])
+        del self.offset_denom
+        self.offset_denom = offset_denom
+
+        offset_gradient_accum = self.offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask]
+        offset_gradient_accum = offset_gradient_accum.view([-1, 1])
+        del self.offset_gradient_accum
+        self.offset_gradient_accum = offset_gradient_accum
+
+        # update opacity accum
+        if anchors_mask.sum()>0:
+            self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+            self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+
+        temp_opacity_accum = self.opacity_accum[~prune_mask]
+        del self.opacity_accum
+        self.opacity_accum = temp_opacity_accum
+
+        temp_anchor_demon = self.anchor_demon[~prune_mask]
+        del self.anchor_demon
+        self.anchor_demon = temp_anchor_demon
+
         if prune_mask.shape[0]>0:
-            self.prune_anchor(prune_mask, anchors_mask)
+            self.prune_anchor(prune_mask)
 
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 

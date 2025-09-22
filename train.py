@@ -160,7 +160,6 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                 # keep hash-grid under the global lambda (or split if you really want)
                 loss = loss + rate_loss + args_param.lmbda * (bit_hash_grid / denom)
             else:
-                print("whats going on my man")
                 loss = loss + args_param.lmbda * (bit_per_param + bit_hash_grid / denom)
 
         loss.backward()
@@ -233,7 +232,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
                 # add statis
-                #gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
+                gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
                 if iteration not in range(3000, 4000):  # let the model get fit to quantization
                     # densification
                     if iteration > opt.update_from and iteration % opt.update_interval == 0:
