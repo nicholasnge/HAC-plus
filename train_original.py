@@ -91,7 +91,6 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         is_synthetic_nerf=is_synthetic_nerf,
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path)
-    anchorScoreTracker = AnchorScoreTracker()
 
     gaussians.update_anchor_bound()
 
@@ -178,8 +177,8 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                     # densification
                     if iteration > opt.update_from and iteration % opt.update_interval == 0:
                         gaussians.adjust_anchor(
-                            grad_scale_by_obj=args.grad_scale_by_obj,
-                            prune_scale_by_obj=args.prune_scale_by_obj,
+                            grad_scale_by_obj={0: 1.0, 1: 1.0},
+                            prune_scale_by_obj={0: 1.0, 1: 1.0},
                             check_interval=opt.update_interval,
                             success_threshold=opt.success_threshold,
                             grad_threshold=opt.densify_grad_threshold,
@@ -482,29 +481,8 @@ if __name__ == "__main__":
     parser.add_argument("--log2_2D", type=int, default = 15)
     parser.add_argument("--n_features", type=int, default = 4)
     parser.add_argument("--lmbda", type=float, default = 0.001)
-    parser.add_argument("--segIter", type=int, default = 1600)
-    parser.add_argument("--segReq", type=float, default = 0.1)
-    parser.add_argument("--segSpread", type=float, default = 0.05)
-    parser.add_argument("--grad_scale_by_obj", type=str, default=False)
-    parser.add_argument("--prune_scale_by_obj", type=str, default=False)
     
     args = parser.parse_args(sys.argv[1:])
-
-    def _parse_obj_map(s: str):
-        try:
-            d = json.loads(s)
-        except json.JSONDecodeError:
-            # fallback: "0:1.5,1:0.75"
-            d = {}
-            if s.strip():
-                for item in s.split(","):
-                    k, v = item.split(":")
-                    d[k.strip()] = v.strip()
-        # ensure correct dtypes
-        return {int(k): float(v) for k, v in d.items()}
-
-    args.grad_scale_by_obj  = _parse_obj_map(args.grad_scale_by_obj)
-    args.prune_scale_by_obj = _parse_obj_map(args.prune_scale_by_obj)
 
     args.save_iterations.append(args.iterations)
 
