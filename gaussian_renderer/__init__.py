@@ -40,7 +40,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     bit_per_feat_param = None
     bit_per_scaling_param = None
     bit_per_offsets_param = None
-    bit_per_param_by_obj = None
+    bpp_by_obj = None
+    share_by_obj = None
 
     Q_feat = 1
     Q_scaling = 0.001
