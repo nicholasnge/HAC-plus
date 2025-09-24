@@ -120,17 +120,21 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             m0 = (obj_ids_chosen == 0)
             m1 = ~m0
             def _bpp_group(bf, bs, bo, m):
-                # bf, bs, bo: tensors with grad (per-symbol bits from entropy models)
+                # bf, bs, bo are per-symbol bit tensors (already masked by your masks)
                 if m.any():
-                    bits = bf[m].sum() + bs[m].sum() + bo[m].sum()     # stays in graph
-                    denom = bf[m].numel() + bs[m].numel() + bo[m].numel()  # Python int (const)
-                    return bits / max(1, denom)                        # <-- NO .detach()
+                    bits_sum = bf[m].sum() + bs[m].sum() + bo[m].sum()
+                    # Denominator uses potential param count (matches original paper’s global denom)
+                    denom = bf[m].numel() + bs[m].numel() + bo[m].numel()  # Python int
+                    return bits_sum / max(1, denom)  # tensor, keeps grad
                 else:
-                    # empty group: return a 0 tensor on the right device/dtype
                     return torch.zeros((), device=bf.device, dtype=bf.dtype)
             bpp0 = _bpp_group(bit_feat, bit_scaling, bit_offsets, m0)
             bpp1 = _bpp_group(bit_feat, bit_scaling, bit_offsets, m1)
-            bit_per_param_by_obj = {0: bpp0, 1: bpp1}
+            # Anchor-share weights (match the way the original global denom splits across groups)
+            share0 = m0.float().mean()         # tensor scalar in [0,1]
+            share1 = 1.0 - share0
+            bpp_by_obj   = {0: bpp0, 1: bpp1}          # tensors with grad
+            share_by_obj = {0: share0, 1: share1}      # tensors (no grad needed but fine)
 
             bit_per_feat_param = torch.sum(bit_feat) / bit_feat.numel()
             bit_per_scaling_param = torch.sum(bit_scaling) / bit_scaling.numel()
@@ -225,7 +229,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         rot = rot[the_mask]
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask, bit_per_param, bit_per_feat_param, bit_per_scaling_param, bit_per_offsets_param, bit_per_param_by_obj
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, bit_per_param, bit_per_feat_param, bit_per_scaling_param, bit_per_offsets_param, bpp_by_obj, share_by_obj
     else:
         return xyz, color, opacity, scaling, rot, time_sub
 

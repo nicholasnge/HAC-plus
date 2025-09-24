@@ -104,8 +104,8 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
     iter_end = torch.cuda.Event(enable_timing = True)
 
     # NEW
-    cameraManager = CameraManager(scene.getTrainCameras(), 60)
-    #cameraManager = UnlimitedVRAMCameraManager(scene.getTrainCameras())
+    #cameraManager = CameraManager(scene.getTrainCameras(), 60)
+    cameraManager = UnlimitedVRAMCameraManager(scene.getTrainCameras())
     initial_num_anchors = gaussians.get_anchor.shape[0]
 
     ema_loss_for_log = 0.0
@@ -153,12 +153,23 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
             _, bit_hash_grid, MB_hash_grid, _ = get_binary_vxl_size((gaussians.get_encoding_params()+1)/2)
             denom = gaussians._anchor.shape[0]*(gaussians.feat_dim+6+3*gaussians.n_offsets)
 
-            bpp_by_obj = render_pkg.get("bit_per_param_by_obj", None)
-            if bpp_by_obj is not None:
-                rate_loss = args_param.lmbda_obj0 * args_param.lmbda * bpp_by_obj.get(0, torch.tensor(0.0, device=image.device)) + \
-                            args_param.lmbda_obj1 * args_param.lmbda * bpp_by_obj.get(1, torch.tensor(0.0, device=image.device))
-                # keep hash-grid under the global lambda (or split if you really want)
-                loss = loss + rate_loss + args_param.lmbda * (bit_hash_grid / denom)
+            bpp_by_obj   = render_pkg.get("bpp_by_obj",   None)  # {0: tensor, 1: tensor}
+            share_by_obj = render_pkg.get("share_by_obj", None)  # {0: tensor, 1: tensor}
+            zero = torch.zeros((), device=image.device)
+            if bpp_by_obj is not None and share_by_obj is not None:
+                base = args_param.lmbda
+                lam0 = args_param.lmbda_obj0
+                lam1 = args_param.lmbda_obj1
+                # share-weighted bpp (matches original when lam0=lam1=1)
+                rate_loss = base * (
+                    lam0 * share_by_obj.get(0, zero) * bpp_by_obj.get(0, zero) +
+                    lam1 * share_by_obj.get(1, zero) * bpp_by_obj.get(1, zero)
+                )
+                # keep hash-grid under the global lambda with the original global denom
+                _, bit_hash_grid, MB_hash_grid, _ = get_binary_vxl_size((gaussians.get_encoding_params()+1)/2)
+                denom = gaussians._anchor.shape[0] * (gaussians.feat_dim + 6 + 3*gaussians.n_offsets)
+
+                loss = loss + rate_loss + base * (bit_hash_grid / denom)
             else:
                 loss = loss + args_param.lmbda * (bit_per_param + bit_hash_grid / denom)
 
