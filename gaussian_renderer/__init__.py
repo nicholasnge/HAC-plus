@@ -244,7 +244,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
     
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask, bp_param, bp_feat_param, bp_scaling_param, bp_offsets_param, bp_by_obj = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, bp_param, bp_feat_param, bp_scaling_param, bp_offsets_param, bpp_by_obj, share_by_obj = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
     else:
         xyz, color, opacity, scaling, rot, time_sub = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, step=step)
 
@@ -299,7 +299,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "bit_per_feat_param": bp_feat_param,
                 "bit_per_scaling_param": bp_scaling_param,
                 "bit_per_offsets_param": bp_offsets_param,
-                "bit_per_param_by_obj": bp_by_obj,   # NEW
+                "bpp_by_obj": bpp_by_obj,   # NEW
+                "share_by_obj": share_by_obj,
             }
     else:
         return {"render": rendered_image,
